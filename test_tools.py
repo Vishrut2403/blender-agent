@@ -1,9 +1,9 @@
 from agent_side.tools import (
-    get_scene_state,
-    add_object,
-    set_material,
-    set_location,
-    render_scene,
+	get_scene_state,
+	add_object,
+	set_material,
+	set_location,
+	render_scene,
 )
 
 print("--- Scene state (before) ---")

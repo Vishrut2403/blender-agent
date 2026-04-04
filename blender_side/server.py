@@ -56,7 +56,7 @@ def handle_client(conn: socket.socket):
 				event.set()
 
 			bpy.app.timers.register(main_thread_task, first_interval=0.0)
-			event.wait(timeout=)
+			event.wait(timeout=120)
 			response = result_container.get("data", {"ok": False, "error": "Timeout"})
 		except Exception:
 			response = {"ok": False, "error": traceback.format_exc()}

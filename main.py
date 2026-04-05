@@ -1,5 +1,5 @@
 import sys
-from agent_side.agent import run_agent as run_local
+from agent_side.agent import run_agent as run_local, SessionMemory
 from agent_side.agent_gemini import run_agent as run_gemini
 
 
@@ -15,6 +15,8 @@ def main():
 
 	print("Type 'quit' to exit.\n")
 
+	memory = SessionMemory() if not use_gemini else None
+
 	while True:
 		try:
 			instruction = input("You: ").strip()
@@ -26,7 +28,12 @@ def main():
 		if instruction.lower() in ("quit", "exit", "q"):
 			print("Bye!")
 			break
-		_run(instruction)
+
+		if use_gemini:
+			_run(instruction)
+		else:
+			memory = run_local(instruction, memory)
+
 		print()
 
 

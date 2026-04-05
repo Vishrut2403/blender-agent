@@ -1,4 +1,4 @@
 {
-  "reportMissingImports": false,
-  "ignore": ["blender_side/**"]
+	"reportMissingImports": false,
+	"ignore": ["blender_side/**"]
 }

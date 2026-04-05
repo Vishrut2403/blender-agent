@@ -15,7 +15,7 @@ client = OpenAI(
 	api_key="ollama",
 )
 
-PLANNER_MODEL  = "qwen3.5:9b"
+PLANNER_MODEL  = "qwen3.5:4b"
 EXECUTOR_MODEL = "qwen3.5:4b"
 
 TOOLS: list[dict[str, Any]] = [
@@ -127,7 +127,8 @@ def run_planner(user_instruction: str, scene_state: str) -> str:
 Given a user instruction and the current scene state, write a clear numbered
 step-by-step plan for what tools to call and in what order.
 Be specific about object names, colors (RGBA 0-1), and locations (x,y,z).
-Do not call any tools yourself — just write the plan as text."""
+Do not call any tools yourself — just write the plan as text.
+Be concise — maximum 5 steps."""
 		},
 		{
 			"role": "user",
@@ -137,6 +138,7 @@ Do not call any tools yourself — just write the plan as text."""
 	response = client.chat.completions.create(
 		model=PLANNER_MODEL,
 		messages=messages,
+		extra_body={"think": False},
 	)
 	plan = response.choices[0].message.content or ""
 	print(f"[Planner] Plan:\n{plan}")
@@ -148,14 +150,15 @@ def run_executor(plan: str, scene_state: str) -> list[dict[str, Any]]:
 	messages: list[ChatCompletionMessageParam] = [
 		{
 			"role": "system",
-			"content": """You are a Blender 3D executor. You receive a plan and
-current scene state. Execute the plan step by step using the available tools.
+			"content": """You are a Blender 3D executor. You receive a plan and current scene state.
+You MUST execute ALL steps in the plan using the available tools.
+Do not stop until every single step is done.
 Use exact object names from the scene. Colors are RGBA floats 0-1.
-Stop once all steps are done."""
+Do not explain what you are doing — just call the tools."""
 		},
 		{
 			"role": "user",
-			"content": f"Plan to execute:\n{plan}\n\nCurrent scene:\n{scene_state}"
+			"content": f"Execute ALL steps of this plan:\n{plan}\n\nCurrent scene:\n{scene_state}\n\nCall tools for every step. Do not stop early."
 		}
 	]
 
@@ -166,6 +169,7 @@ Stop once all steps are done."""
 			model=EXECUTOR_MODEL,
 			tools=TOOLS,  # type: ignore[arg-type]
 			messages=messages,
+			extra_body={"think": False},
 		)
 
 		msg = response.choices[0].message
@@ -208,20 +212,19 @@ def run_critic(user_instruction: str, plan: str, actions: list[dict[str, Any]]) 
 	messages: list[ChatCompletionMessageParam] = [
 		{
 			"role": "system",
-			"content": """You are a Blender 3D critic. Review what was done
-and give the user a short friendly summary. Point out anything wrong or incomplete."""
+			"content": "You are a Blender 3D critic. Write a 2 sentence summary of what was done. Be direct."
 		},
 		{
 			"role": "user",
-			"content": f"Original instruction: {user_instruction}\n\nPlan:\n{plan}\n\nActions taken:\n{actions_text}"
+			"content": f"Instruction: {user_instruction}\nActions taken:\n{actions_text}\nWrite a 2 sentence summary."
 		}
 	]
 	response = client.chat.completions.create(
 		model=PLANNER_MODEL,
 		messages=messages,
 	)
-	return response.choices[0].message.content or ""
-
+	result = response.choices[0].message.content
+	return result if result else "Done."
 
 def run_agent(user_instruction: str) -> str:
 	print(f"\n{'='*50}")

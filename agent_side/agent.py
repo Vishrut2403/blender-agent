@@ -1,28 +1,47 @@
-from openai import OpenAI
+import json
+import logging
 from dataclasses import dataclass, field
+from typing import Any
+
+from openai import OpenAI
+
+from agent_side.bridge import BlenderResponse
+from agent_side.config import (
+	OLLAMA_BASE_URL,
+	OLLAMA_API_KEY,
+	LOCAL_MODEL,
+	MAX_TOOL_CALLS,
+	MAX_PLAN_RETRIES,
+	ACTION_LOG_WINDOW,
+)
 from agent_side.tools import (
-	BlenderResponse,
 	get_scene_state,
 	add_object,
 	set_material,
 	set_location,
 	render_scene,
 )
-import json
 
-client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
-MODEL = "qwen3.5:4b"
+logger = logging.getLogger(__name__)
 
-# ─── Session Memory ────────────────────────────────────────────────────────────
+client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
+
+
+# Session Memory 
 
 @dataclass
 class SessionMemory:
-	conversation_history: list[dict] = field(default_factory=list)
-	action_log: list[dict] = field(default_factory=list)
+	conversation_history: list[dict[str, str]] = field(default_factory=list)
+	action_log: list[dict[str, Any]] = field(default_factory=list)
 	scene_cache: dict | None = None
 
-	def add_turn(self, instruction: str, tools_called: list[str],
-				 objects_affected: list[str], summary: str):
+	def add_turn(
+		self,
+		instruction: str,
+		tools_called: list[str],
+		objects_affected: list[str],
+		summary: str,
+	) -> None:
 		turn_num = len(self.action_log) + 1
 		self.action_log.append({
 			"turn": turn_num,
@@ -34,12 +53,11 @@ class SessionMemory:
 		self.conversation_history.append({"role": "user", "content": instruction})
 		self.conversation_history.append({"role": "assistant", "content": summary})
 
-	def get_action_summary(self, last_n: int = 5) -> str:
+	def get_action_summary(self, last_n: int = ACTION_LOG_WINDOW) -> str:
 		if not self.action_log:
 			return "No previous actions."
-		recent = self.action_log[-last_n:]
 		lines = []
-		for entry in recent:
+		for entry in self.action_log[-last_n:]:
 			lines.append(
 				f"Turn {entry['turn']}: \"{entry['instruction']}\" → "
 				f"{entry['summary']} (tools: {', '.join(entry['tools_called'])})"
@@ -62,9 +80,9 @@ class SessionMemory:
 		return "\n".join(lines)
 
 
-# ─── Tool Schema ───────────────────────────────────────────────────────────────
+# Tool Schema 
 
-TOOLS = [
+TOOLS: list[dict[str, Any]] = [
 	{
 		"type": "function",
 		"function": {
@@ -139,7 +157,7 @@ TOOLS = [
 			"parameters": {
 				"type": "object",
 				"properties": {
-					"output_path": {"type": "string"}
+					"output_path": {"type": "string"},
 				},
 				"required": ["output_path"],
 			},
@@ -148,9 +166,9 @@ TOOLS = [
 ]
 
 
-# ─── Tool Dispatch ─────────────────────────────────────────────────────────────
+# Tool Dispatch 
 
-def _serialize(result) -> str:
+def _serialize(result: BlenderResponse | dict | Any) -> str:
 	"""Convert any tool result to a JSON string safe for the messages list."""
 	if isinstance(result, BlenderResponse):
 		return json.dumps({
@@ -164,23 +182,8 @@ def _serialize(result) -> str:
 	return str(result)
 
 
-def dispatch_tool(name: str, args: dict) -> str:
-	if name == "get_scene_state":
-		result = get_scene_state()
-	elif name == "add_object":
-		result = add_object(**args)
-	elif name == "set_material":
-		result = set_material(**args)
-	elif name == "set_location":
-		result = set_location(**args)
-	elif name == "render_scene":
-		result = render_scene(**args)
-	else:
-		return json.dumps({"error": f"Unknown tool: {name}"})
-
-	return _serialize(result)
-
-def _parse_scene(result) -> dict | None:
+def _parse_scene(result: BlenderResponse | str | Any) -> dict | None:
+	"""Parse a BlenderResponse or JSON string into a scene dict."""
 	try:
 		if isinstance(result, BlenderResponse):
 			raw = result.stdout or result.value
@@ -196,10 +199,29 @@ def _parse_scene(result) -> dict | None:
 		return None
 
 
-# ─── Agents ───────────────────────────────────────────────────────────────────
+def dispatch_tool(name: str, args: dict[str, Any]) -> str:
+	"""Route a tool call by name and return a serialized JSON string result."""
+	logger.debug("Dispatching tool: %s | args: %s", name, args)
+	if name == "get_scene_state":
+		result = get_scene_state()
+	elif name == "add_object":
+		result = add_object(**args)
+	elif name == "set_material":
+		result = set_material(**args)
+	elif name == "set_location":
+		result = set_location(**args)
+	elif name == "render_scene":
+		result = render_scene(**args)
+	else:
+		logger.warning("Unknown tool requested: %s", name)
+		return json.dumps({"error": f"Unknown tool: {name}"})
+	return _serialize(result)
+
+
+# Agents 
 
 def run_planner(instruction: str, memory: SessionMemory) -> str:
-	system_prompt = f"""You are a Blender scene planner. Your job is to produce a clear, 
+	system_prompt = f"""You are a Blender scene planner. Your job is to produce a clear,
 step-by-step plan to fulfill the user's instruction using available tools.
 
 CURRENT SCENE:
@@ -210,50 +232,66 @@ PREVIOUS ACTIONS THIS SESSION:
 
 Available tools: get_scene_state, add_object, set_material, set_location, render_scene
 
-Output ONLY a numbered list of steps. No explanations. No code. Just the plan.
-If the instruction references a previous object (e.g. "it", "that"), resolve it using 
-the scene state and action history above."""
+Rules:
+- Output ONLY a numbered list of steps. No explanations. No code.
+- NEVER invent object names. Object names are assigned by Blender after add_object runs.
+- Always call add_object before set_material or set_location on a new object.
+- If the instruction references a previous object (e.g. "it", "that"), resolve it using
+  the scene state and action history above.
+- For set_material, always specify color as [R, G, B, A] with values between 0 and 1."""
 
-	response = client.chat.completions.create(
-		model=MODEL,
-		messages=[
-			{"role": "system", "content": system_prompt},
-			{"role": "user", "content": instruction},
-		],
-		extra_body={"think": False},
-	)
-	return response.choices[0].message.content.strip()
+	logger.debug("Running planner for: %s", instruction)
+	try:
+		response = client.chat.completions.create(
+			model=LOCAL_MODEL,
+			messages=[
+				{"role": "system", "content": system_prompt},
+				{"role": "user", "content": instruction},
+			],
+			extra_body={"think": False},
+		)
+		return response.choices[0].message.content.strip()
+	except Exception:
+		logger.exception("Planner LLM call failed")
+		return ""
 
 
-def run_executor(plan: str, memory: SessionMemory) -> tuple[list[str], list[str], dict]:
-	"""Returns (tools_called, objects_affected, updated_scene_cache)."""
+def run_executor(
+	plan: str,
+	memory: SessionMemory,
+) -> tuple[list[str], list[str], dict | None]:
+	"""Execute a plan by calling tools. Returns (tools_called, objects_affected, updated_cache)."""
 	system_prompt = f"""You are a Blender executor. You receive a plan and call tools to carry it out.
 
 CURRENT SCENE:
 {memory.get_scene_summary()}
 
-Execute the plan step by step using the available tools. 
+Execute the plan step by step using the available tools.
 After completing all steps, do NOT call any more tools."""
 
-	messages = [
+	messages: list[dict[str, Any]] = [
 		{"role": "system", "content": system_prompt},
 		{"role": "user", "content": f"Execute this plan:\n{plan}"},
 	]
 
-	tools_called = []
-	objects_affected = []
+	tools_called: list[str] = []
+	objects_affected: list[str] = []
 	updated_cache = memory.scene_cache
 
-	for _ in range(10):  # max 10 tool calls per turn
-		response = client.chat.completions.create(
-			model=MODEL,
-			messages=messages,
-			tools=TOOLS,
-			tool_choice="auto",
-			extra_body={"think": False},
-		)
-		msg = response.choices[0].message
+	for _ in range(MAX_TOOL_CALLS):
+		try:
+			response = client.chat.completions.create(
+				model=LOCAL_MODEL,
+				messages=messages,
+				tools=TOOLS,
+				tool_choice="auto",
+				extra_body={"think": False},
+			)
+		except Exception:
+			logger.exception("Executor LLM call failed")
+			break
 
+		msg = response.choices[0].message
 		if not msg.tool_calls:
 			break
 
@@ -262,28 +300,25 @@ After completing all steps, do NOT call any more tools."""
 		for tc in msg.tool_calls:
 			name = tc.function.name
 			args = json.loads(tc.function.arguments)
-			result = dispatch_tool(name, args)  # always a JSON string now
+			result = dispatch_tool(name, args)
 
 			tools_called.append(name)
 
-			# refresh cache when scene changes
-			if name in ("add_object", "set_material", "set_location"):
-				# track added object name from result string
-				if name == "add_object":
-					try:
-						parsed_result = json.loads(result)
-						obj_name = parsed_result.get("stdout", "").split("Added ")[-1].split(" at")[0]
-						if obj_name:
-							objects_affected.append(obj_name)
-					except (json.JSONDecodeError, AttributeError):
-						pass
+			if name == "add_object":
+				try:
+					parsed_result = json.loads(result)
+					stdout = parsed_result.get("stdout", "")
+					obj_name = stdout.split("Added ")[-1].split(" at")[0]
+					if obj_name:
+						objects_affected.append(obj_name)
+				except (json.JSONDecodeError, AttributeError):
+					logger.debug("Could not parse object name from add_object result")
 
-				scene = get_scene_state()
-				parsed = _parse_scene(scene)
+			if name in ("add_object", "set_material", "set_location"):
+				parsed = _parse_scene(get_scene_state())
 				if parsed:
 					updated_cache = parsed
 
-			# if scene was explicitly queried, cache it
 			if name == "get_scene_state":
 				parsed = _parse_scene(result)
 				if parsed:
@@ -298,68 +333,87 @@ After completing all steps, do NOT call any more tools."""
 	return tools_called, objects_affected, updated_cache
 
 
-def run_critic(instruction: str, tools_called: list[str], memory: SessionMemory) -> str:
-	system_prompt = """You are a Blender critic. Review whether the instruction was fulfilled.
-Be concise. Say PASS or FAIL and one sentence why."""
-
-	content = f"""Instruction: {instruction}
-Tools called: {', '.join(tools_called) if tools_called else 'none'}
-Current scene:
-{memory.get_scene_summary()}"""
-
-	response = client.chat.completions.create(
-		model=MODEL,
-		messages=[
-			{"role": "system", "content": system_prompt},
-			{"role": "user", "content": content},
-		],
+def run_critic(
+	instruction: str,
+	tools_called: list[str],
+	memory: SessionMemory,
+) -> str:
+	"""Review whether the instruction was fulfilled. Returns PASS/FAIL with one sentence."""
+	system_prompt = (
+		"You are a Blender critic. Review whether the instruction was fulfilled. "
+		"Be concise. Say PASS or FAIL and one sentence why."
 	)
-	return response.choices[0].message.content.strip()
+	content = (
+		f"Instruction: {instruction}\n"
+		f"Tools called: {', '.join(tools_called) if tools_called else 'none'}\n"
+		f"Current scene:\n{memory.get_scene_summary()}"
+	)
+	try:
+		response = client.chat.completions.create(
+			model=LOCAL_MODEL,
+			max_tokens=50,
+			messages=[
+				{"role": "system", "content": system_prompt},
+				{"role": "user", "content": content},
+			],
+		)
+		return response.choices[0].message.content.strip()
+	except Exception:
+		logger.exception("Critic LLM call failed")
+		return "SKIP"
 
 
-# ─── Main Entry Point ──────────────────────────────────────────────────────────
+# Main Entry Point 
 
 def run_agent(instruction: str, memory: SessionMemory | None = None) -> SessionMemory:
 	"""
-	Run one turn of the agent. Pass in memory from the previous turn to maintain
-	session context. Returns the updated memory object.
+	Run one turn of the agent pipeline (Planner → Executor → Critic).
+	Pass memory from the previous turn to maintain session context.
+	Returns the updated SessionMemory.
 	"""
 	if memory is None:
 		memory = SessionMemory()
 
+	logger.info("New instruction: %s", instruction)
 	print(f"\n{'='*50}")
 	print(f"INSTRUCTION: {instruction}")
 	print(f"{'='*50}")
 
-	# — Planner —
+	# Planner 
 	print("\n[Planner] Thinking...")
 	plan = ""
-	for attempt in range(3):
+	for attempt in range(MAX_PLAN_RETRIES):
 		plan = run_planner(instruction, memory)
 		if plan.strip():
 			break
-		print(f"[Planner] Empty plan, retrying ({attempt+1}/3)...")
+		logger.warning("Planner returned empty plan (attempt %d/%d)", attempt + 1, MAX_PLAN_RETRIES)
+		print(f"[Planner] Empty plan, retrying ({attempt+1}/{MAX_PLAN_RETRIES})...")
 
 	if not plan.strip():
+		logger.error("Planner failed to produce a plan after %d attempts", MAX_PLAN_RETRIES)
 		print("[Planner] Failed to produce a plan. Skipping turn.")
 		return memory
 
 	print(f"[Planner] Plan:\n{plan}")
 
-	# — Executor —
+	# Executor 
 	print("\n[Executor] Running...")
 	tools_called, objects_affected, updated_cache = run_executor(plan, memory)
 	memory.scene_cache = updated_cache
+	logger.info("Executor finished. Tools called: %s", tools_called)
 	print(f"[Executor] Tools called: {tools_called}")
 
-	# — Critic —
-	print("\n[Critic] Reviewing...")
-	#verdict = run_critic(instruction, tools_called, memory)
-	#print(f"[Critic] {verdict}")
+	# — Critic (disabled for speed, re-enable when needed) —
+	# verdict = run_critic(instruction, tools_called, memory)
+	# print(f"[Critic] {verdict}")
 	verdict = "SKIP"
 
-	# — Update Memory —
-	summary = f"Called {', '.join(tools_called)}. Objects: {', '.join(objects_affected) or 'none modified'}. Critic: {verdict}"
+	# Update Memory 
+	summary = (
+		f"Called {', '.join(tools_called) or 'no tools'}. "
+		f"Objects: {', '.join(objects_affected) or 'none modified'}. "
+		f"Critic: {verdict}"
+	)
 	memory.add_turn(
 		instruction=instruction,
 		tools_called=tools_called,

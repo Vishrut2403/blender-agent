@@ -1,7 +1,7 @@
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from openai import OpenAI
 
@@ -26,8 +26,11 @@ logger = logging.getLogger(__name__)
 
 client = OpenAI(base_url=OLLAMA_BASE_URL, api_key=OLLAMA_API_KEY)
 
+# Type alias for the broadcast callback
+BroadcastFn = Callable[[dict[str, Any]], None]
 
-# Session Memory 
+
+# ─── Session Memory ────────────────────────────────────────────────────────────
 
 @dataclass
 class SessionMemory:
@@ -79,8 +82,25 @@ class SessionMemory:
 			lines.append(f"  - {name} ({kind}) at {loc}, material: {mat}")
 		return "\n".join(lines)
 
+	def to_dict(self) -> dict[str, Any]:
+		"""Serialize memory to a plain dict for JSON persistence."""
+		return {
+			"conversation_history": self.conversation_history,
+			"action_log": self.action_log,
+			"scene_cache": self.scene_cache,
+		}
 
-# Tool Schema 
+	@classmethod
+	def from_dict(cls, data: dict[str, Any]) -> "SessionMemory":
+		"""Restore memory from a persisted dict."""
+		m = cls()
+		m.conversation_history = data.get("conversation_history", [])
+		m.action_log           = data.get("action_log", [])
+		m.scene_cache          = data.get("scene_cache", None)
+		return m
+
+
+# ─── Tool Schema ───────────────────────────────────────────────────────────────
 
 TOOLS: list[dict[str, Any]] = [
 	{
@@ -166,7 +186,7 @@ TOOLS: list[dict[str, Any]] = [
 ]
 
 
-# Tool Dispatch 
+# ─── Tool Dispatch ─────────────────────────────────────────────────────────────
 
 def _serialize(result: BlenderResponse | dict | Any) -> str:
 	"""Convert any tool result to a JSON string safe for the messages list."""
@@ -218,9 +238,23 @@ def dispatch_tool(name: str, args: dict[str, Any]) -> str:
 	return _serialize(result)
 
 
-# Agents 
+# ─── Emit helper ──────────────────────────────────────────────────────────────
 
-def run_planner(instruction: str, memory: SessionMemory) -> str:
+def _emit(event_type: str, content: str, broadcast_fn: BroadcastFn | None) -> None:
+	"""Print to terminal and optionally broadcast to WebSocket."""
+	print(f"[{event_type}] {content}")
+	if broadcast_fn:
+		broadcast_fn({"type": event_type, "content": content})
+
+
+# ─── Agents ───────────────────────────────────────────────────────────────────
+
+def run_planner(
+	instruction: str,
+	memory: SessionMemory,
+	broadcast_fn: BroadcastFn | None = None,
+) -> str:
+	"""Generate a step-by-step plan for the given instruction using session context."""
 	system_prompt = f"""You are a Blender scene planner. Your job is to produce a clear,
 step-by-step plan to fulfill the user's instruction using available tools.
 
@@ -241,6 +275,7 @@ Rules:
 - For set_material, always specify color as [R, G, B, A] with values between 0 and 1."""
 
 	logger.debug("Running planner for: %s", instruction)
+	_emit("planner", "Thinking...", broadcast_fn)
 	try:
 		response = client.chat.completions.create(
 			model=LOCAL_MODEL,
@@ -250,7 +285,9 @@ Rules:
 			],
 			extra_body={"think": False},
 		)
-		return response.choices[0].message.content.strip()
+		plan = response.choices[0].message.content.strip()
+		_emit("planner", plan, broadcast_fn)
+		return plan
 	except Exception:
 		logger.exception("Planner LLM call failed")
 		return ""
@@ -259,6 +296,7 @@ Rules:
 def run_executor(
 	plan: str,
 	memory: SessionMemory,
+	broadcast_fn: BroadcastFn | None = None,
 ) -> tuple[list[str], list[str], dict | None]:
 	"""Execute a plan by calling tools. Returns (tools_called, objects_affected, updated_cache)."""
 	system_prompt = f"""You are a Blender executor. You receive a plan and call tools to carry it out.
@@ -277,6 +315,8 @@ After completing all steps, do NOT call any more tools."""
 	tools_called: list[str] = []
 	objects_affected: list[str] = []
 	updated_cache = memory.scene_cache
+
+	_emit("executor", "Running...", broadcast_fn)
 
 	for _ in range(MAX_TOOL_CALLS):
 		try:
@@ -300,14 +340,23 @@ After completing all steps, do NOT call any more tools."""
 		for tc in msg.tool_calls:
 			name = tc.function.name
 			args = json.loads(tc.function.arguments)
+
+			_emit("tool", f"Calling {name}({args})", broadcast_fn)
 			result = dispatch_tool(name, args)
+
+			# try to surface a clean result message
+			try:
+				parsed_result = json.loads(result)
+				tool_msg = parsed_result.get("stdout") or parsed_result.get("error") or "done"
+			except (json.JSONDecodeError, AttributeError):
+				tool_msg = result
+			_emit("tool_result", f"{name} → {tool_msg}", broadcast_fn)
 
 			tools_called.append(name)
 
 			if name == "add_object":
 				try:
-					parsed_result = json.loads(result)
-					stdout = parsed_result.get("stdout", "")
+					stdout = json.loads(result).get("stdout", "")
 					obj_name = stdout.split("Added ")[-1].split(" at")[0]
 					if obj_name:
 						objects_affected.append(obj_name)
@@ -324,12 +373,21 @@ After completing all steps, do NOT call any more tools."""
 				if parsed:
 					updated_cache = parsed
 
+			# notify UI when a render completes so it can show the image
+			if name == "render_scene":
+				try:
+					output_path = args.get("output_path", "")
+					_emit("render", output_path, broadcast_fn)
+				except Exception:
+					pass
+
 			messages.append({
 				"role": "tool",
 				"tool_call_id": tc.id,
 				"content": result,
 			})
 
+	_emit("executor", f"Done. Tools called: {tools_called}", broadcast_fn)
 	return tools_called, objects_affected, updated_cache
 
 
@@ -337,6 +395,7 @@ def run_critic(
 	instruction: str,
 	tools_called: list[str],
 	memory: SessionMemory,
+	broadcast_fn: BroadcastFn | None = None,
 ) -> str:
 	"""Review whether the instruction was fulfilled. Returns PASS/FAIL with one sentence."""
 	system_prompt = (
@@ -348,6 +407,7 @@ def run_critic(
 		f"Tools called: {', '.join(tools_called) if tools_called else 'none'}\n"
 		f"Current scene:\n{memory.get_scene_summary()}"
 	)
+	_emit("critic", "Reviewing...", broadcast_fn)
 	try:
 		response = client.chat.completions.create(
 			model=LOCAL_MODEL,
@@ -357,58 +417,57 @@ def run_critic(
 				{"role": "user", "content": content},
 			],
 		)
-		return response.choices[0].message.content.strip()
+		verdict = response.choices[0].message.content.strip()
+		_emit("critic", verdict, broadcast_fn)
+		return verdict
 	except Exception:
 		logger.exception("Critic LLM call failed")
 		return "SKIP"
 
 
-# Main Entry Point 
+# ─── Main Entry Point ──────────────────────────────────────────────────────────
 
-def run_agent(instruction: str, memory: SessionMemory | None = None) -> SessionMemory:
+def run_agent(
+	instruction: str,
+	memory: SessionMemory | None = None,
+	broadcast_fn: BroadcastFn | None = None,
+) -> SessionMemory:
 	"""
 	Run one turn of the agent pipeline (Planner → Executor → Critic).
 	Pass memory from the previous turn to maintain session context.
+	Optionally pass broadcast_fn to stream events to a WebSocket.
 	Returns the updated SessionMemory.
 	"""
 	if memory is None:
 		memory = SessionMemory()
 
 	logger.info("New instruction: %s", instruction)
-	print(f"\n{'='*50}")
-	print(f"INSTRUCTION: {instruction}")
-	print(f"{'='*50}")
+	_emit("instruction", instruction, broadcast_fn)
 
-	# Planner 
-	print("\n[Planner] Thinking...")
+	# ─ Planner ─
 	plan = ""
 	for attempt in range(MAX_PLAN_RETRIES):
-		plan = run_planner(instruction, memory)
+		plan = run_planner(instruction, memory, broadcast_fn)
 		if plan.strip():
 			break
 		logger.warning("Planner returned empty plan (attempt %d/%d)", attempt + 1, MAX_PLAN_RETRIES)
-		print(f"[Planner] Empty plan, retrying ({attempt+1}/{MAX_PLAN_RETRIES})...")
+		_emit("planner", f"Empty plan, retrying ({attempt+1}/{MAX_PLAN_RETRIES})...", broadcast_fn)
 
 	if not plan.strip():
-		logger.error("Planner failed to produce a plan after %d attempts", MAX_PLAN_RETRIES)
-		print("[Planner] Failed to produce a plan. Skipping turn.")
+		logger.error("Planner failed after %d attempts", MAX_PLAN_RETRIES)
+		_emit("error", "Planner failed to produce a plan. Skipping turn.", broadcast_fn)
 		return memory
 
-	print(f"[Planner] Plan:\n{plan}")
-
-	# Executor 
-	print("\n[Executor] Running...")
-	tools_called, objects_affected, updated_cache = run_executor(plan, memory)
+	# ─ Executor ─
+	tools_called, objects_affected, updated_cache = run_executor(plan, memory, broadcast_fn)
 	memory.scene_cache = updated_cache
 	logger.info("Executor finished. Tools called: %s", tools_called)
-	print(f"[Executor] Tools called: {tools_called}")
 
-	# — Critic (disabled for speed, re-enable when needed) —
-	# verdict = run_critic(instruction, tools_called, memory)
-	# print(f"[Critic] {verdict}")
+	# ─ Critic (disabled for speed, re-enable when needed) ─
+	# verdict = run_critic(instruction, tools_called, memory, broadcast_fn)
 	verdict = "SKIP"
 
-	# Update Memory 
+	# ─ Update Memory ─
 	summary = (
 		f"Called {', '.join(tools_called) or 'no tools'}. "
 		f"Objects: {', '.join(objects_affected) or 'none modified'}. "
@@ -421,4 +480,5 @@ def run_agent(instruction: str, memory: SessionMemory | None = None) -> SessionM
 		summary=summary,
 	)
 
+	_emit("done", "", broadcast_fn)
 	return memory

@@ -1,0 +1,405 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+	<title>Blender Agent</title>
+	<link rel="stylesheet" href="/static/style.css" />
+	<link rel="preconnect" href="https://fonts.googleapis.com">
+	<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div class="app">
+
+	<!-- Sidebar  -->
+	<aside class="sidebar">
+	<div class="sidebar-header">
+		<div class="logo">
+		<span class="logo-mark">B</span>
+		<span class="logo-text">lender<br>Agent</span>
+		</div>
+		<div class="status-pill" id="status-pill">
+		<span class="status-dot"></span>
+		<span id="status-label">ready</span>
+		</div>
+	</div>
+
+	<div class="sidebar-section-label">Sessions</div>
+	<div class="session-list" id="session-list">
+		<div class="session-empty">No saved sessions yet.</div>
+	</div>
+	</aside>
+
+	<!-- Main  -->
+	<main class="main">
+
+	<div class="chat-area" id="chat-area">
+		<div class="welcome">
+		<div class="welcome-icon">⬡</div>
+		<h2>What should I build?</h2>
+		<p>Describe a Blender scene in plain English.</p>
+		<div class="examples">
+			<button class="example-chip" onclick="fillInput('Add a red sphere at the origin and render the scene')">
+			Add a red sphere and render
+			</button>
+			<button class="example-chip" onclick="fillInput('Create a blue cube, then move it to position 3, 0, 1')">
+			Blue cube, move to 3,0,1
+			</button>
+			<button class="example-chip" onclick="fillInput('What objects are currently in the scene?')">
+			What's in the scene?
+			</button>
+		</div>
+		</div>
+	</div>
+
+	<div class="input-bar">
+		<textarea
+		id="instruction-input"
+		placeholder="Describe what to build or change in Blender..."
+		rows="1"
+		autocomplete="off"
+		spellcheck="false"
+		></textarea>
+		<button class="send-btn" id="send-btn" onclick="sendInstruction()">
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+			<line x1="22" y1="2" x2="11" y2="13"/>
+			<polygon points="22 2 15 22 11 13 2 9 22 2"/>
+		</svg>
+		</button>
+	</div>
+
+	</main>
+</div>
+
+<script>
+// State 
+
+let ws = null;
+let currentSessionId = null;
+let isAgentRunning = false;
+
+// WebSocket 
+
+function connectWS(sessionId) {
+	const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+	const url = `${protocol}://${location.host}/ws/${sessionId}`;
+	ws = new WebSocket(url);
+
+	ws.onmessage = (evt) => {
+	const event = JSON.parse(evt.data);
+	handleAgentEvent(event);
+	};
+
+	ws.onclose = () => {
+	// If the agent finished cleanly, the server closes the WS.
+	// Mark as done.
+	setRunning(false);
+	};
+
+	ws.onerror = (err) => {
+	appendEvent('error', 'WebSocket connection failed. Check that the server is running.');
+	setRunning(false);
+	};
+}
+
+// Agent event rendering 
+
+const EVENT_LABELS = {
+	instruction: null,           // rendered as a user bubble, not an agent event
+	planner:     'Planner',
+	executor:    'Executor',
+	tool:        'Tool Call',
+	tool_result: 'Result',
+	render:      null,           // rendered as an image card
+	done:        null,           // silent
+	error:       'Error',
+};
+
+// Groups: consecutive planner/executor/tool/tool_result events are collected
+// into a single collapsible block.
+let _agentBlock = null;  // current open agent event block element
+
+function handleAgentEvent(event) {
+	const { type, content } = event;
+
+	if (type === 'instruction') {
+	closeAgentBlock();
+	appendUserBubble(content);
+	return;
+	}
+
+	if (type === 'render') {
+	closeAgentBlock();
+	appendRenderCard(content);
+	return;
+	}
+
+	if (type === 'done') {
+	closeAgentBlock();
+	return;
+	}
+
+	if (type === 'error') {
+	closeAgentBlock();
+	appendEvent('error', content);
+	return;
+	}
+
+	// Planner / executor / tool / tool_result → collect into agent block
+	ensureAgentBlock();
+	appendEventRow(type, content);
+}
+
+function ensureAgentBlock() {
+	if (_agentBlock) return;
+
+	const block = document.createElement('div');
+	block.className = 'agent-block';
+
+	const header = document.createElement('button');
+	header.className = 'agent-block-header';
+	header.innerHTML = `
+	<span class="agent-block-label">Agent Processing</span>
+	<span class="agent-block-chevron">▾</span>
+	`;
+	header.onclick = () => {
+	block.classList.toggle('collapsed');
+	header.querySelector('.agent-block-chevron').textContent =
+		block.classList.contains('collapsed') ? '▸' : '▾';
+	};
+
+	const body = document.createElement('div');
+	body.className = 'agent-block-body';
+
+	block.appendChild(header);
+	block.appendChild(body);
+
+	getOrCreateAgentRow().appendChild(block);
+	_agentBlock = block;
+	scrollToBottom();
+}
+
+function closeAgentBlock() {
+	_agentBlock = null;
+}
+
+function appendEventRow(type, content) {
+	if (!_agentBlock) return;
+	const body = _agentBlock.querySelector('.agent-block-body');
+	const row = document.createElement('div');
+	row.className = `event-row event-${type}`;
+
+	const label = EVENT_LABELS[type] || type;
+	row.innerHTML = `<span class="event-label">${label}</span><span class="event-content">${escapeHtml(content)}</span>`;
+	body.appendChild(row);
+	scrollToBottom();
+}
+
+function getOrCreateAgentRow() {
+	const chatArea = document.getElementById('chat-area');
+	const row = document.createElement('div');
+	row.className = 'message-row agent-row';
+	chatArea.appendChild(row);
+	return row;
+}
+
+function appendUserBubble(content) {
+	clearWelcome();
+	const chatArea = document.getElementById('chat-area');
+	const row = document.createElement('div');
+	row.className = 'message-row user-row';
+	row.innerHTML = `<div class="bubble user-bubble">${escapeHtml(content)}</div>`;
+	chatArea.appendChild(row);
+	scrollToBottom();
+}
+
+function appendRenderCard(url) {
+	clearWelcome();
+	const chatArea = document.getElementById('chat-area');
+	const row = document.createElement('div');
+	row.className = 'message-row agent-row';
+	row.innerHTML = `
+	<div class="render-card">
+		<div class="render-label">Render output</div>
+		<img src="${url}" alt="Blender render" class="render-img" onclick="openImage('${url}')" />
+		<a href="${url}" download class="render-download">Download</a>
+	</div>
+	`;
+	chatArea.appendChild(row);
+	scrollToBottom();
+}
+
+function appendEvent(type, content) {
+	clearWelcome();
+	const chatArea = document.getElementById('chat-area');
+	const row = document.createElement('div');
+	row.className = 'message-row agent-row';
+	row.innerHTML = `<div class="event-standalone event-${type}">${escapeHtml(content)}</div>`;
+	chatArea.appendChild(row);
+	scrollToBottom();
+}
+
+// Send instruction 
+
+async function sendInstruction() {
+	if (isAgentRunning) return;
+
+	const input = document.getElementById('instruction-input');
+	const instruction = input.value.trim();
+	if (!instruction) return;
+
+	input.value = '';
+	autoResize(input);
+	setRunning(true);
+
+	try {
+	const res = await fetch('/chat', {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ instruction }),
+	});
+	const data = await res.json();
+	if (data.error) {
+		appendEvent('error', data.error);
+		setRunning(false);
+		return;
+	}
+	currentSessionId = data.session_id;
+	connectWS(currentSessionId);
+	} catch (err) {
+	appendEvent('error', 'Failed to reach the server: ' + err.message);
+	setRunning(false);
+	}
+}
+
+// Sessions sidebar 
+
+async function loadSessions() {
+	try {
+	const res = await fetch('/sessions');
+	const sessions = await res.json();
+	renderSessions(sessions);
+	} catch {
+	// Server might not be ready yet — fail silently.
+	}
+}
+
+function renderSessions(sessions) {
+	const list = document.getElementById('session-list');
+	if (!sessions.length) {
+	list.innerHTML = '<div class="session-empty">No saved sessions yet.</div>';
+	return;
+	}
+	list.innerHTML = sessions.map(s => `
+	<button class="session-item" onclick="loadSession('${s.id}')">
+		<span class="session-instruction">${escapeHtml(s.first_instruction || s.id)}</span>
+		<span class="session-meta">${formatDate(s.saved_at)} · ${s.turns} turn${s.turns !== 1 ? 's' : ''}</span>
+	</button>
+	`).join('');
+}
+
+async function loadSession(sessionId) {
+	try {
+	const res = await fetch(`/sessions/${sessionId}`);
+	const data = await res.json();
+	if (data.error) return;
+
+	// Clear chat and replay the action log as a summary view.
+	document.getElementById('chat-area').innerHTML = '';
+
+	const log = data.action_log || [];
+	log.forEach(entry => {
+		appendUserBubble(entry.instruction);
+		appendEvent('executor', entry.summary);
+	});
+
+	// Highlight selected session
+	document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+	event.currentTarget.classList.add('active');
+
+	} catch (err) {
+	appendEvent('error', 'Could not load session.');
+	}
+}
+
+// UI helpers 
+
+function setRunning(running) {
+	isAgentRunning = running;
+	const pill = document.getElementById('status-pill');
+	const label = document.getElementById('status-label');
+	const btn = document.getElementById('send-btn');
+	const input = document.getElementById('instruction-input');
+
+	pill.classList.toggle('running', running);
+	label.textContent = running ? 'running' : 'ready';
+	btn.disabled = running;
+	input.disabled = running;
+
+	if (!running) {
+	// Refresh session list after a turn completes.
+	loadSessions();
+	}
+}
+
+function clearWelcome() {
+	const welcome = document.querySelector('.welcome');
+	if (welcome) welcome.remove();
+}
+
+function scrollToBottom() {
+	const area = document.getElementById('chat-area');
+	area.scrollTop = area.scrollHeight;
+}
+
+function fillInput(text) {
+	const input = document.getElementById('instruction-input');
+	input.value = text;
+	input.focus();
+	autoResize(input);
+}
+
+function autoResize(el) {
+	el.style.height = 'auto';
+	el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+function openImage(url) {
+	window.open(url, '_blank');
+}
+
+function escapeHtml(str) {
+	return String(str)
+	.replace(/&/g, '&amp;')
+	.replace(/</g, '&lt;')
+	.replace(/>/g, '&gt;')
+	.replace(/"/g, '&quot;');
+}
+
+function formatDate(iso) {
+	if (!iso) return '';
+	try {
+	return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+	} catch { return iso; }
+}
+
+// Input key handling 
+
+document.getElementById('instruction-input').addEventListener('keydown', (e) => {
+	if (e.key === 'Enter' && !e.shiftKey) {
+	e.preventDefault();
+	sendInstruction();
+	}
+});
+
+document.getElementById('instruction-input').addEventListener('input', function() {
+	autoResize(this);
+});
+
+// Init 
+
+loadSessions();
+</script>
+</body>
+</html>
